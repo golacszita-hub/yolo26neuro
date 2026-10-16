@@ -1,0 +1,6 @@
+path: /Users/Zita/Documents/EGYETEM/Önlab/yolo26/DATASETS/yolo26_mean_waveform_overfit/yolo26_spike_detection_100
+train: images/train
+val: images/val
+
+names:
+  0: spike
