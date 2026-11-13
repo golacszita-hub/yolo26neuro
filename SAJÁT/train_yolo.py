@@ -12,11 +12,11 @@ from ultralytics.models.yolo.detect import DetectionTrainer
 from ultralytics.utils.torch_utils import unwrap_model
 
 # ---- settings ----
-MODE = "gray"                  # "gray" | "rgb"
+MODE = "rgb"                  # "gray" | "rgb"
 STAGE = "stage2_up_to_3_spikes"  # "stage1_single_spike" | "stage2_up_to_3_spikes" | "stage3_any_spike_count"
-SINGLE_CLS = True              # True: spike / no spike, False: one class per unit
+SINGLE_CLS = False             # True: spike / no spike, False: one class per unit
 EPOCHS = 20
-WEIGHTS = HERE / "yolo26n.pt"
+WEIGHTS = "/Users/Zita/Documents/EGYETEM/Önlab/yolo26/yolo26neuro/SAJÁT/runs/spikeyolo/stage2_up_to_3_spikes_rgb_agnostic_15ep/weights/best.pt"
 
 DATASETS = {
     "gray": HERE.parent.parent / "DATASETS/nwb_asinh_stages/build_20261112T160151Z_gray",
