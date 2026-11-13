@@ -114,7 +114,7 @@ class Config:
     gray_vmax_uv: float = 1000.0
     # "gray": the asinh curve as 8-bit gray PNG.  "rgb": R = that gray image, G = the whitened
     # signal, B = NEO energy.  YOLO's first conv takes 3 channels either way.
-    image_mode: str = "gray"
+    image_mode: str = "rgb"
     # Whitening (SpikeInterface `whiten`, mode "local"): each channel is decorrelated from the
     # electrodes within whiten_radius_um and scaled to unit noise.  G maps it with the same asinh
     # formula in noise units (knee 2 sd, like 10 uV at ~5 uV noise).
@@ -194,10 +194,10 @@ class Config:
 
 # --------------------------------------------------------------------------- recording
 
-def load_recording(nwb_path, uv_per_bit, freq_min, freq_max, margin_ms):
+def load_recording(nwb_path, uv_per_bit, freq_min, freq_max, margin_ms, electrical_series_path=None):
     import spikeinterface.full as si
 
-    recording = si.read_nwb(nwb_path)
+    recording = si.read_nwb(nwb_path, electrical_series_path=electrical_series_path)
     recording.set_channel_gains([uv_per_bit] * recording.get_num_channels())
     recording.set_channel_offsets([0.0] * recording.get_num_channels())
     recording_bp, recording_pp = preprocess_chain(recording, freq_min, freq_max, margin_ms, with_bandpass=True)
@@ -662,6 +662,10 @@ def build_templates(cfg, stored, sigma, shift=None, recomputed=None):
         peak_row[k], peak_sign[k], center_dt[k] = r, np.sign(templates[k][r, t]), t - center
         thr = np.maximum(cfg.box_fraction * absw[r, t], cfg.box_min_sigma * sigma)
         mask = absw >= thr[:, None]
+        if not mask[r, t]:  # peak below 3 sigma (or sigma NaN): keep the peak so the box is never empty
+            print(f"warning: unit {k} peak {absw[r, t]:.3g} uV is below its box threshold {thr[r]:.3g} uV "
+                  f"(noise sigma {np.asarray(sigma)[r]:.3g} uV on row {r}); it gets the minimum box", flush=True)
+            mask[r, t] = True
         # Rows are depth-first over 4 probe columns, so the same column at the next
         # depth is 4 rows away: bridge +-4 rows before taking the peak's component.
         bridged = ndimage.binary_dilation(mask, structure=np.ones((5, 1), bool))
@@ -686,15 +690,19 @@ def prepare(cfg: Config):
     with pynwb.NWBHDF5IO(cfg.nwb_path, "r") as io:
         series = list(io.read().acquisition.values())[0]
         uv_per_bit, nwb_offset, nwb_unit = float(series.conversion), float(series.offset), series.unit
+        # Given explicitly: some SpikeInterface versions cannot find the series / t_start themselves.
+        series_path, series_rate = f"acquisition/{series.name}", float(series.rate)
+        series_t_start = float(series.starting_time or 0.0)
         dset_name, dset_shape = series.data.name, tuple(series.data.shape)
         block_frames = series.data.chunks[0] if series.data.chunks else 1 << 20
     if not np.isclose(nwb_offset, 0.0):
         raise ValueError(f"Unexpected NWB offset {nwb_offset}")
 
     recording, recording_bp, recording_pp = load_recording(
-        cfg.nwb_path, uv_per_bit, cfg.freq_min, cfg.freq_max, cfg.filter_margin_ms
+        cfg.nwb_path, uv_per_bit, cfg.freq_min, cfg.freq_max, cfg.filter_margin_ms, electrical_series_path=series_path
     )
-    sorting = si.read_nwb_sorting(cfg.nwb_path)
+    sorting = si.read_nwb_sorting(cfg.nwb_path, electrical_series_path=series_path,
+                                  sampling_frequency=series_rate, t_start=series_t_start)
     fs = float(recording.get_sampling_frequency())
     num_frames = int(recording.get_num_frames())
     if recording.get_num_segments() != 1 or sorting.get_num_segments() != 1:
