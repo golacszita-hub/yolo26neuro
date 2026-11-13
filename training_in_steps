@@ -1,0 +1,122 @@
+Claude
+Train stage · PY
+"""Train YOLO26n on one stage of the gray or rgb dataset. Change the settings below and run the file.
+Logs to W&B every training step (batch losses + LR) and every epoch (train/val losses, mAP, plots)."""
+import sys
+from pathlib import Path
+ 
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))  # the local ultralytics fork
+ 
+import wandb
+from ultralytics import YOLO, settings
+from ultralytics.data import build_yolo_dataset
+from ultralytics.models.yolo.detect import DetectionTrainer
+from ultralytics.utils.torch_utils import unwrap_model
+ 
+# ---- settings ----
+MODE = "rgb"                  # "gray" | "rgb"
+STAGE = "stage2_up_to_3_spikes"  # "stage1_single_spike" | "stage2_up_to_3_spikes" | "stage3_any_spike_count"
+SINGLE_CLS = False             # True: spike / no spike, False: one class per unit
+EPOCHS = 20
+LOG_EVERY = 1                  # log step losses every N batches (raise it if the W&B charts get too dense)
+WEIGHTS = "/Users/Zita/Documents/EGYETEM/Önlab/yolo26/yolo26neuro/SAJÁT/runs/spikeyolo/stage2_up_to_3_spikes_rgb_agnostic_15ep/weights/best.pt"
+ 
+DATASETS = {
+    "gray": HERE.parent.parent / "DATASETS/nwb_asinh_stages/build_20261112T160151Z_gray",
+    "rgb": HERE.parent.parent / "DATASETS/nwb_asinh_stages/build_20261112T161035Z_rgb",
+}
+DATA = DATASETS[MODE] / STAGE / "data.yaml"
+NAME = f"{STAGE}_{MODE}_{'agnostic' if SINGLE_CLS else 'multiclass'}_{EPOCHS}ep"
+ 
+ 
+# Needed for no rect: Ultralytics always builds the validation set with rect=True during training.
+class NoRectTrainer(DetectionTrainer):
+    def build_dataset(self, img_path, mode="train", batch=None):
+        gs = max(int(unwrap_model(self.model).stride.max()), 32)
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=False, stride=gs)
+ 
+ 
+# ---- W&B ----
+# The built-in Ultralytics W&B callback only logs once per epoch with step=epoch, and W&B drops anything
+# logged with a smaller step than before, so it can't be mixed with per-batch logging. Turn it off and log ourselves.
+settings.update({"wandb": False})
+run = wandb.init(
+    project="spikeyolo",
+    name=NAME,
+    config=dict(mode=MODE, stage=STAGE, single_cls=SINGLE_CLS, epochs=EPOCHS, weights=WEIGHTS, data=str(DATA)),
+)
+ 
+# Each group of charts gets its own x-axis: step charts vs. batches, epoch charts vs. epochs
+wandb.define_metric("global_step")
+wandb.define_metric("epoch")
+wandb.define_metric("step/*", step_metric="global_step")
+wandb.define_metric("train/*", step_metric="epoch")
+wandb.define_metric("val/*", step_metric="epoch")
+wandb.define_metric("metrics/*", step_metric="epoch")
+wandb.define_metric("lr/*", step_metric="epoch")
+ 
+global_step = 0
+ 
+ 
+def log_batch(trainer):
+    global global_step
+    global_step += 1
+    if global_step % LOG_EVERY:
+        return
+    log = trainer.label_loss_items(trainer.loss_items, prefix="step")  # this batch's box/cls/... losses
+    for i, group in enumerate(trainer.optimizer.param_groups):
+        log[f"step/lr_pg{i}"] = group["lr"]  # changes every batch during warmup
+    log["step/epoch"] = global_step / len(trainer.train_loader)
+    log["global_step"] = global_step
+    wandb.log(log)
+ 
+ 
+def log_epoch(trainer):
+    log = {"epoch": trainer.epoch + 1}
+    log.update(trainer.label_loss_items(trainer.tloss, prefix="train"))  # mean train losses of the epoch
+    log.update(trainer.metrics)  # val/* losses and metrics/* (precision, recall, mAP50, mAP50-95)
+    log.update(trainer.lr)       # lr/pg0, lr/pg1, lr/pg2
+    wandb.log(log)
+ 
+ 
+def log_end(trainer):
+    # results.png, PR/F1 curves, confusion matrices, train/val batch images
+    for p in sorted(Path(trainer.save_dir).glob("*.png")):
+        wandb.log({f"plots/{p.stem}": wandb.Image(str(p))})
+    best = Path(trainer.best)
+    if best.exists():
+        artifact = wandb.Artifact(f"{NAME}_best".replace("/", "_"), type="model")
+        artifact.add_file(str(best))
+        run.log_artifact(artifact)
+ 
+ 
+model = YOLO(WEIGHTS)
+model.add_callback("on_train_batch_end", log_batch)
+model.add_callback("on_fit_epoch_end", log_epoch)
+model.add_callback("on_train_end", log_end)
+ 
+try:
+    model.train(
+        data=str(DATA),
+        single_cls=SINGLE_CLS,
+        epochs=EPOCHS,
+        trainer=NoRectTrainer,
+        imgsz=128,
+        batch=64,
+        device="mps",
+        workers=0,
+        seed=0,
+        project=str(HERE / "runs/spikeyolo"),
+        name=NAME,
+        exist_ok=True,
+        plots=True,
+        rect=False,
+        # no augmentation
+        hsv_h=0.0, hsv_s=0.0, hsv_v=0.0, degrees=0.0, translate=0.0, scale=0.0, shear=0.0, perspective=0.0,
+        flipud=0.0, fliplr=0.0, bgr=0.0, mosaic=0.0, mixup=0.0, cutmix=0.0, copy_paste=0.0, erasing=0.0, close_mosaic=0,
+    )
+finally:
+    wandb.finish()  # also closes the run if training crashes or you stop it
+ 
+Claude finished the response
