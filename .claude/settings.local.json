@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /Users/Zita/Documents/EGYETEM/Önlab/yolo26/yolo26neuro/SAJÁT; sed -n '/^def ensure_cache/,/^def open_cache/p' nwb_yolo_dataset.py | grep -n \"chain\\\\|key\\\\|inspect\" | head; grep -n \"^wrote\\\\|EarlyStopping\\\\|test split\" runs/gray_vs_rgb_v2.log | tail -3; tail -c 300 runs/gray_vs_rgb_v2.log | tr '\\\\r' '\\\\n' | tail -1)",
+      "Bash(python3 -)"
+    ],
+    "additionalDirectories": [
+      "/Users/Zita/Documents/EGYETEM/Önlab/yolo26/yolo26neuro/SAJÁT"
+    ]
+  }
+}
