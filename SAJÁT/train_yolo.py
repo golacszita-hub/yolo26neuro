@@ -5,6 +5,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # the local ultralytics fork
 
+import torch
 import wandb
 from ultralytics import YOLO, settings
 from ultralytics.data import build_yolo_dataset
@@ -16,7 +17,8 @@ MODE = "rgb"                  # "gray" | "rgb"
 STAGE = "stage2_up_to_3_spikes"  # "stage1_single_spike" | "stage2_up_to_3_spikes" | "stage3_any_spike_count"
 SINGLE_CLS = False             # True: spike / no spike, False: one class per unit
 EPOCHS = 20
-WEIGHTS = "/Users/Zita/Documents/EGYETEM/Önlab/yolo26/yolo26neuro/SAJÁT/runs/spikeyolo/stage2_up_to_3_spikes_rgb_agnostic_15ep/weights/best.pt"
+WEIGHTS = HERE / "runs/spikeyolo/stage2_up_to_3_spikes_rgb_agnostic_15ep/weights/best.pt"  # not in git: copy it over, or use HERE / "yolo26n.pt"
+DEVICE = 0 if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"  # NVIDIA, Mac, else CPU
 
 DATASETS = {
     "gray": HERE.parent.parent / "DATASETS/nwb_asinh_stages/build_20261112T160151Z_gray",
@@ -43,7 +45,7 @@ YOLO(WEIGHTS).train(
     trainer=NoRectTrainer,
     imgsz=128, 
     batch=64, 
-    device="mps", 
+    device=DEVICE,
     workers=0, 
     seed=0,
     project=str(HERE / "runs/spikeyolo"), 

@@ -78,6 +78,7 @@ import platform
 import shutil
 import sys
 import time
+import unicodedata
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -93,18 +94,21 @@ STAGES = {
     "stage3_any_spike_count": (0, None),
 }
 SPLITS = ("train", "val", "test")
+# Default data folder = two levels above this file (yolo26/, next to the yolo26neuro repo): the NWB and
+# DATASETS/ live there on every computer.  NFC: macOS gives "Ö" decomposed, the cache key stores it composed.
+DATA_ROOT = Path(unicodedata.normalize("NFC", str(Path(__file__).resolve().parents[2])))
 
 
 @dataclass
 class Config:
-    nwb_path: str = "/Users/Zita/Documents/EGYETEM/Önlab/yolo26/Rat01_Insertion2_Depth2.nwb"
-    output_root: str = "/Users/Zita/Documents/EGYETEM/Önlab/yolo26/DATASETS/nwb_asinh_stages"
+    nwb_path: str = str(DATA_ROOT / "Rat01_Insertion2_Depth2.nwb")
+    output_root: str = str(DATA_ROOT / "DATASETS" / "nwb_asinh_stages")
     freq_min: float = 300.0
     freq_max: float = 3000.0
     # Zero-phase filter edge margin; 50 ms makes any read (128 samples or 4 s) bit-identical.
     filter_margin_ms: float = 50.0
     # Where the preprocessed int16 copy of the recording (~12 GB) is kept; shared by all builds.
-    cache_dir: str = "/Users/Zita/Documents/EGYETEM/Önlab/yolo26/DATASETS/nwb_pp_cache"
+    cache_dir: str = str(DATA_ROOT / "DATASETS" / "nwb_pp_cache")
     window: int = 128
     # Fixed uV -> gray: gray = 127.5 * (1 + asinh(v / knee) / asinh(vmax / knee)).
     # Linear (noise keeps its texture) below ~knee, logarithmic above (one gray level is
@@ -182,13 +186,14 @@ class Config:
     negative_margin: int = 40
     negatives_per_chunk: int | None = None  # None = every clean window found
     # Sampling.  None = no cap (balancing per unit waits for the classification step).
-    max_per_unit_count: dict | None = None  # e.g. {"train": 600, "val": 150, "test": 150} per (unit, label count)
+    # At most this many windows per (split, unit, label count); None = no cap.  These are the Nov 12 build values.
+    max_per_unit_count: dict | None = field(default_factory=lambda: {"train": 600, "val": 150, "test": 150})
     # Stage 3: sliding window over each chunk; large, so only built when asked.
     build_stage3: bool = False
     stage3_stride: int = 64
-    stage3_max_images: dict | None = None  # e.g. {"train": 40000, "val": 8000, "test": 8000}
+    stage3_max_images: dict | None = field(default_factory=lambda: {"train": 40000, "val": 8000, "test": 8000})
     seed: int = 0
-    workers: int = max(1, (os.cpu_count() or 2) - 2)
+    workers: int = max(1, min((os.cpu_count() or 2) - 2, 61))  # Windows allows at most 61 pool workers
     preview_count: int = 12
 
 
@@ -282,7 +287,7 @@ def ensure_cache(cfg, uv_per_bit, fs, dset_name, shape, block_frames):
     version = spikeinterface.__version__
     folder = Path(cfg.cache_dir) / f"{Path(cfg.nwb_path).stem}_bp{cfg.freq_min:g}-{cfg.freq_max:g}_m{cfg.filter_margin_ms:g}_cmr"
     pp_path, meta_path = folder / "traces_pp_int16.raw", folder / "meta.json"
-    nbytes = int(np.prod(shape)) * 2
+    nbytes = int(shape[0]) * int(shape[1]) * 2  # Python ints: np.prod overflows int32 on Windows with numpy 1.x
     if meta_path.exists() and pp_path.exists() and pp_path.stat().st_size == nbytes:
         old = json.loads(meta_path.read_text())
         verified = old.pop("spikeinterface_verified", [])
@@ -748,6 +753,10 @@ def prepare(cfg: Config):
         frames.append(st)
         classes.append(np.full(len(st), k, np.int64))
     frames, classes = np.concatenate(frames), np.concatenate(classes)
+    if len(frames) == 0 or frames.min() < 0 or frames.max() >= num_frames:
+        raise RuntimeError(f"sorted spike frames {frames.min() if len(frames) else '-'}..{frames.max() if len(frames) else '-'} "
+                           f"do not fit the recording (0..{num_frames - 1}): the sorting's sampling frequency or "
+                           f"t_start is wrong (expected {series_rate} Hz, t_start {series_t_start} s)")
     o = np.argsort(frames, kind="stable")
     stored = []
     for u in unit_ids:
@@ -828,7 +837,17 @@ def run_pass1(cfg, ctx):
               else ("nwb_mean_waveform" if shift[k] == 0 else f"nwb_mean_waveform_shifted_{int(shift[k]):+d}")
               for k in range(n_units)]
     fallback = [k for k in range(n_units) if recomputed[k] is None]
-    widest = int((boxes[:, 0] + boxes[:, 1] + 1).max())
+    # Spike times must line up with the signal: then every averaged template has a clear peak. Averaged
+    # noise (misaligned times) has none, every box falls back to the minimum and all labels are useless.
+    peak_uv = np.abs(templates[np.arange(n_units), peak_row, cfg.template_before + center_dt])
+    weak = peak_uv < cfg.box_min_sigma * sigma[peak_row]
+    if not np.isfinite(sigma).all() or weak[[k for k in range(n_units) if recomputed[k] is not None]].mean() > 0.1:
+        raise RuntimeError(
+            f"{int(weak.sum())}/{n_units} unit templates have no peak above {cfg.box_min_sigma} x noise "
+            f"(median peak {np.nanmedian(peak_uv):.1f} uV, median noise {np.nanmedian(sigma):.1f} uV): the spike "
+            "times do not line up with the signal. Check the SpikeInterface version (0.104.x), the sorting's "
+            "sampling frequency / t_start, and delete the cache folder if it was copied from another computer.")
+    widest =int((boxes[:, 0] + boxes[:, 1] + 1).max())
     edge_margin = cfg.edge_margin if cfg.edge_margin is not None else (widest + 1) // 2
     if 2 * (edge_margin + cfg.edge_band) >= cfg.window:
         raise ValueError(f"edge_margin {edge_margin} leaves no valid zone in a {cfg.window}-sample window")
@@ -1229,6 +1248,7 @@ def build(cfg: Config, image_modes=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--quick", action="store_true", help="small smoke-test build")
+    parser.add_argument("--nwb", default=None, help=f"NWB file (default {Config.nwb_path})")
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--image-mode", choices=IMAGE_MODES, nargs="+", default=None,
@@ -1243,6 +1263,8 @@ def main():
         cfg.stage3_max_images = {"train": 300, "val": 100, "test": 100}
         cfg.build_stage3 = True  # small here, so the stage-3 code is exercised
         cfg.template_min_spikes = 20  # few chunks: at most ~80 spikes per unit are averaged
+    if args.nwb:
+        cfg.nwb_path = args.nwb
     if args.image_mode:
         cfg.image_mode = args.image_mode[0]
     if args.cache_dir:
