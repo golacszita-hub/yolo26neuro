@@ -20,9 +20,6 @@ channel), symmetric, and wide/tall enough to cover every sample above ``box_frac
 peak.  Units with fewer than ``template_min_spikes`` averaged spikes fall back to the NWB units
 table's mean waveform (``mean_waveform_all_channels_filt``), moved ~1 sample to the peak time
 measured here.
-Optional (off by default, ``dedupe_iou=None``): removing duplicate sorter
-spikes (two similar units, <= 5 samples apart, box IoU > 0.5; here mostly unit_46 repeating
-unit_97's spikes) before pass 2.
 
 Edge rule, the same in every stage: each picture has an invalid strip at its left and right
 edge, ``edge_margin`` samples wide = half the widest box (rounded up).  A spike is labelled
@@ -88,11 +85,7 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-STAGES = {
-    "stage1_single_spike": (1, 1),
-    "stage2_up_to_3_spikes": (1, 3),
-    "stage3_any_spike_count": (0, None),
-}
+STAGES = ("stage1_single_spike", "stage2_up_to_3_spikes", "stage3_any_spike_count")
 SPLITS = ("train", "val", "test")
 # Default data folder = two levels above this file (yolo26/, next to the yolo26neuro repo): the NWB and
 # DATASETS/ live there on every computer.  NFC: macOS gives "Ö" decomposed, the cache key stores it composed.
@@ -138,10 +131,7 @@ class Config:
     # Layout of the stored NWB mean waveform: samples before / after the sorted spike frame.
     template_before: int = 40
     template_after: int = 40
-    # Share of the train chunks pass 1 reads (noise sigma, templates), at least pass1_min_chunks.
-    pass1_fraction: float = 1.0
-    pass1_min_chunks: int = 20
-    # Templates (box + tail) are averaged from the recording: at most template_max_per_chunk
+    # Templates (boxes) are averaged from the recording: at most template_max_per_chunk
     # spikes per unit and chunk (spread over the chunk); units with fewer than
     # template_min_spikes averaged spikes fall back to the stored NWB mean waveform.
     template_max_per_chunk: int = 10
@@ -157,21 +147,10 @@ class Config:
     # trace (+-center_search samples) when at least center_min_spikes spikes were seen.
     center_search: int = 5
     center_min_spikes: int = 20
-    # Duplicate sorter spikes: of two spikes of different units within dedupe_max_lag samples
-    # whose boxes overlap with IoU > dedupe_iou AND whose units' mean waveforms correlate above
-    # dedupe_min_template_corr (the same waveform assigned twice), the one of the smaller unit
-    # (template peak) is dropped.  Different-looking units firing together are kept.
-    # dedupe_iou = None keeps every spike.
-    dedupe_max_lag: int = 5
-    dedupe_iou: float | None = None  # off: every sorted spike is kept (0.5 enables the dedupe)
-    dedupe_min_template_corr: float = 0.9
     # Statistics and negatives only (labels do not depend on it): a spike is "weak" if its
     # trough on the peak channel stays below visible_sigma x noise, and negatives have no
     # sample beyond it.
     visible_sigma: float = 5.0
-    # Tail = the last sample after the trough with |template| >= tail_fraction x peak on the peak
-    # row.  Saved with the templates; windows no longer depend on it.
-    tail_fraction: float = 0.10
     # Edge rule (all stages): the picture has an invalid strip of edge_margin samples at its left
     # and right edge; a spike is labelled only if its box centre lies between the strips.
     # None = half the widest box, rounded up, so no labelled box is ever cut.  A centre within
@@ -184,7 +163,6 @@ class Config:
     # share of each split's images, per stage.
     negative_fraction: dict = field(default_factory=lambda: {s: 0.10 for s in STAGES})
     negative_margin: int = 40
-    negatives_per_chunk: int | None = None  # None = every clean window found
     # Sampling.  None = no cap (balancing per unit waits for the classification step).
     # At most this many windows per (split, unit, label count); None = no cap.  These are the Nov 12 build values.
     max_per_unit_count: dict | None = field(default_factory=lambda: {"train": 600, "val": 150, "test": 150})
@@ -577,7 +555,7 @@ def _pass2_chunk(task):
     events = np.concatenate([[0], np.cumsum(np.bincount(frames[lo:hi] - start, minlength=T))])
     starts = np.arange(pad + int(rng.integers(0, W)), T - pad - W + 1, W)
     clean = (crossings[starts + W] == crossings[starts]) & (events[starts + W + m] == events[starts - m])
-    for ws in rng.permutation(starts[clean])[:_W["negatives_per_chunk"]]:
+    for ws in rng.permutation(starts[clean]):
         ws = int(ws)
         items.append({
             "kind": "negative", "split": split,
@@ -612,16 +590,16 @@ def plan_chunks(cfg, num_frames, fs, rng):
 
 
 def stored_peaks(cfg, stored):
-    """Peak row, sign and time offset (from the sorted frame) of every stored mean waveform,
+    """Peak row and time offset (from the sorted frame) of every stored mean waveform,
     searched within +-5 samples of the frame (a later, larger co-firing spike is ignored)."""
     c = cfg.template_before
-    rows, signs, dts = [], [], []
+    rows, dts = [], []
     for w in stored:
         wt = w.T  # (rows, 81)
         near = np.abs(wt[:, c - 5:c + 6])
         r, t = np.unravel_index(np.argmax(near), near.shape)
-        rows.append(r); signs.append(np.sign(wt[r, c - 5 + t])); dts.append(t - 5)
-    return np.array(rows, np.int64), np.array(signs, np.float32), np.array(dts, np.int64)
+        rows.append(r); dts.append(t - 5)
+    return np.array(rows, np.int64), np.array(dts, np.int64)
 
 
 def shift_time(w, shift):
@@ -637,7 +615,7 @@ def shift_time(w, shift):
 
 
 def build_templates(cfg, stored, sigma, shift=None, recomputed=None):
-    """Per-unit templates = the NWB mean waveforms (image rows x time) and CENTRED boxes.
+    """Per-unit templates (image rows x time) and CENTRED boxes.
 
     The box centre is the waveform peak (row r, time frame + center_dt); its half width and
     half height are the largest distance from the peak to any above-threshold sample of the
@@ -655,7 +633,6 @@ def build_templates(cfg, stored, sigma, shift=None, recomputed=None):
     boxes = np.zeros((n_units, 4), np.int64)
     peak_row = np.zeros(n_units, np.int64)
     peak_sign = np.zeros(n_units, np.float32)
-    tail_after = np.zeros(n_units, np.int64)
     center_dt = np.zeros(n_units, np.int64)
     for k in range(n_units):
         absw = np.abs(templates[k])
@@ -680,11 +657,7 @@ def build_templates(cfg, stored, sigma, shift=None, recomputed=None):
         hh = max(r - rr.min(), rr.max() - r)
         dt = int(center_dt[k])
         boxes[k] = (hw - dt, hw + dt, max(r - hh, 0), min(r + hh + 1, n_rows))
-        # Tail: the repolarisation after the trough, which should stay inside anchored windows.
-        tail_thr = max(cfg.tail_fraction * absw[r, t], cfg.box_min_sigma * sigma[r])
-        tail_after[k] = max(np.nonzero(absw[r, center:] >= tail_thr)[0].max(initial=0), boxes[k, 1])
-    source = ["nwb_mean_waveform"] * n_units
-    return templates, boxes, peak_row, peak_sign, tail_after, center_dt, source
+    return templates, boxes, peak_row, peak_sign, center_dt
 
 
 def prepare(cfg: Config):
@@ -773,7 +746,7 @@ def prepare(cfg: Config):
         "uv_per_bit": uv_per_bit, "nwb_unit": nwb_unit, "fs": fs, "num_frames": num_frames,
         # recording*: the lazy NWB chain (the deployment contract, slow to read);
         # traces: the same signal from the cache, (frames, channels) int16 memmap in NWB column order.
-        "recording": recording, "recording_bp": recording_bp, "recording_pp": recording_pp, "sorting": sorting,
+        "recording": recording, "recording_bp": recording_bp, "recording_pp": recording_pp,
         # recording_white: lazy SpikeInterface whitening of the cached signal; whiten_W: its fixed matrix.
         "recording_white": recording_white, "whiten_W": whiten_W,
         "traces": traces, "cache_path": str(cache_path),
@@ -796,10 +769,10 @@ def worker_state(cfg, ctx):
     if "boxes" in ctx:
         state.update({
             "seed": cfg.seed, "sigma": ctx["sigma"], "boxes": ctx["boxes"], "center_dt": ctx["center_dt"],
-            "peak_row": ctx["peak_row"], "peak_sign": ctx["peak_sign"], "tail_after": ctx["tail_after"],
+            "peak_row": ctx["peak_row"], "peak_sign": ctx["peak_sign"],
             "visible_sigma": cfg.visible_sigma,
             "edge_margin": ctx["edge_margin"], "edge_band": cfg.edge_band,
-            "negative_margin": cfg.negative_margin, "negatives_per_chunk": cfg.negatives_per_chunk,
+            "negative_margin": cfg.negative_margin,
             "build_stage3": cfg.build_stage3, "stage3_stride": cfg.stage3_stride,
         })
     return state
@@ -807,13 +780,10 @@ def worker_state(cfg, ctx):
 
 def run_pass1(cfg, ctx):
     """Noise sigma per channel and per-unit templates averaged from the recording (train chunks
-    only); boxes and tails come from those templates.  Units with too few spikes fall back to the
+    only); boxes come from those templates.  Units with too few spikes fall back to the
     stored NWB mean waveform, moved in time to the peak measured in this pipeline."""
     chunks = ctx["chunks"]["train"]
-    if cfg.pass1_fraction < 1.0:  # own rng, so the window selection does not change with this setting
-        n = min(len(chunks), max(cfg.pass1_min_chunks, int(round(len(chunks) * cfg.pass1_fraction))))
-        chunks = [chunks[i] for i in np.sort(np.random.default_rng([cfg.seed, 1]).choice(len(chunks), n, replace=False))]
-    stored_row, _, stored_dt = stored_peaks(cfg, ctx["stored"])
+    stored_row, stored_dt = stored_peaks(cfg, ctx["stored"])
     state = {**worker_state(cfg, ctx), "peak_row": stored_row, "center_search": cfg.center_search,
              "template_before": cfg.template_before, "template_after": cfg.template_after,
              "template_max_per_chunk": cfg.template_max_per_chunk}
@@ -831,7 +801,7 @@ def run_pass1(cfg, ctx):
     measured = np.abs(sums).argmax(axis=1) - h  # peak of the averaged peak-row trace, from the sorted frame
     data_dt = np.where(counts >= cfg.center_min_spikes, measured, stored_dt)
     shift = stored_dt - data_dt  # > 0: the stored waveform is late, move it earlier (fallback units)
-    templates, boxes, peak_row, peak_sign, tail_after, center_dt, source = build_templates(
+    templates, boxes, peak_row, peak_sign, center_dt = build_templates(
         cfg, ctx["stored"], sigma, shift, recomputed)
     source = ["recomputed" if recomputed[k] is not None
               else ("nwb_mean_waveform" if shift[k] == 0 else f"nwb_mean_waveform_shifted_{int(shift[k]):+d}")
@@ -852,7 +822,7 @@ def run_pass1(cfg, ctx):
     if 2 * (edge_margin + cfg.edge_band) >= cfg.window:
         raise ValueError(f"edge_margin {edge_margin} leaves no valid zone in a {cfg.window}-sample window")
     ctx.update({"sigma": sigma, "templates": templates, "boxes": boxes, "peak_row": peak_row,
-                "peak_sign": peak_sign, "tail_after": tail_after, "center_dt": center_dt, "template_source": source,
+                "peak_sign": peak_sign, "center_dt": center_dt, "template_source": source,
                 "timing_shift": np.where([r is None for r in recomputed], shift, 0), "timing_spikes": counts,
                 "template_spikes": tcount, "edge_margin": int(edge_margin)})
     print(f"templates: {n_units - len(fallback)} units averaged from the recording "
@@ -877,52 +847,8 @@ def pass2_tasks(cfg, ctx):
     return tasks
 
 
-def dedupe_events(cfg, ctx):
-    """Drop duplicate sorter spikes: two spikes of different, similar-looking units (template
-    correlation > dedupe_min_template_corr) within dedupe_max_lag samples whose boxes overlap with
-    IoU > dedupe_iou are one event; the smaller unit's spike goes."""
-    n_units = len(ctx["unit_ids"])
-    ctx["dedupe"] = {"removed": 0, "removed_per_unit": {}, "pairs": {}}
-    if cfg.dedupe_iou is None:
-        return
-    fr, cl, B = ctx["event_frames"], ctx["event_classes"].astype(np.int64), ctx["boxes"]
-    amp = np.abs(ctx["templates"]).max(axis=(1, 2))
-    flat = ctx["templates"].reshape(n_units, -1)
-    similar = np.corrcoef(flat) > cfg.dedupe_min_template_corr
-    drop = np.zeros(len(fr), bool)
-    pairs = {}
-    for lag in range(1, cfg.dedupe_max_lag + 1):
-        i = np.arange(len(fr) - lag)
-        j = i + lag
-        m = (fr[j] - fr[i] <= cfg.dedupe_max_lag) & (cl[i] != cl[j])
-        i, j = i[m], j[m]
-        ki, kj = cl[i], cl[j]
-        iw = np.clip(np.minimum(fr[i] + B[ki, 1], fr[j] + B[kj, 1]) + 1 - np.maximum(fr[i] - B[ki, 0], fr[j] - B[kj, 0]), 0, None)
-        ih = np.clip(np.minimum(B[ki, 3], B[kj, 3]) - np.maximum(B[ki, 2], B[kj, 2]), 0, None)
-        area = lambda k: (B[k, 0] + B[k, 1] + 1) * (B[k, 3] - B[k, 2])
-        inter = iw * ih
-        dup = (inter / (area(ki) + area(kj) - inter) > cfg.dedupe_iou) & similar[ki, kj]
-        i, j, ki, kj = i[dup], j[dup], ki[dup], kj[dup]
-        loser = np.where(amp[ki] >= amp[kj], j, i)  # keep the larger unit (ties: the earlier spike)
-        drop[loser] = True
-        for a, b in zip(ki.tolist(), kj.tolist()):
-            key = f"{min(a, b)}-{max(a, b)}"
-            pairs[key] = pairs.get(key, 0) + 1
-    removed = np.bincount(cl[drop], minlength=n_units)
-    ctx["event_frames"], ctx["event_classes"] = fr[~drop], ctx["event_classes"][~drop]
-    ctx["dedupe"] = {
-        "removed": int(drop.sum()),
-        "removed_per_unit": {ctx["class_names"][k]: int(removed[k]) for k in np.nonzero(removed)[0]},
-        "pairs": dict(sorted(pairs.items(), key=lambda x: -x[1])[:20]),
-    }
-    top = ", ".join(f"{n}: {c}" for n, c in sorted(ctx["dedupe"]["removed_per_unit"].items(), key=lambda x: -x[1])[:5])
-    print(f"dedupe: removed {int(drop.sum())} duplicate sorter spikes (top units {top})", flush=True)
-
-
 def run_pass2(cfg, ctx):
-    """Candidate images and labels for all planned chunks (after removing duplicate spikes)."""
-    if "dedupe" not in ctx:  # once per ctx, so re-running pass 2 in the notebook does not dedupe twice
-        dedupe_events(cfg, ctx)
+    """Candidate images and labels for all planned chunks."""
     by_kind = {"anchored": [], "group": [], "tile": [], "negative": []}
     unit_total = np.zeros(len(ctx["unit_ids"]), np.int64)
     unit_visible = np.zeros(len(ctx["unit_ids"]), np.int64)
@@ -1054,30 +980,30 @@ def write_stage(stage_dir, items, class_names, cfg, pool_dir, height):
     )
 
 
-def window_image(ctx, window_start_frame, lut=None, window=128, enc=None):
+def window_image(ctx, window_start_frame, window=128, enc=None):
     """uint8 image (channels in image order, samples[, 3]) of one window, read from the cache.
-    `enc` (from make_encoder) gives any image mode; otherwise the lookup table `lut` / ctx["lut"]."""
+    `enc` (from make_encoder) gives any image mode; otherwise the gray lookup table ctx["lut"]."""
     if enc is None:
-        enc = {"mode": "lut", "lut": ctx["lut"] if lut is None else lut}
+        enc = {"mode": "lut", "lut": ctx["lut"]}
     x = ctx["traces"][window_start_frame - 1:window_start_frame + window + 1, ctx["order"]].T
     return encode(enc, x)
 
 
-def plot_items(items, title, count, rng, ctx=None, lut=None, ax_size=4, path=None, enc=None):
-    """Random examples with their boxes.  Items carry no pixels: pass `ctx` to render them."""
+def plot_items(items, title, count, rng, ctx, path=None, enc=None):
+    """Random examples with their boxes, rendered from the cache."""
     import matplotlib.pyplot as plt
 
     picks = [items[i] for i in rng.choice(len(items), size=min(count, len(items)), replace=False)]
     cols = 4
     nrows = int(np.ceil(len(picks) / cols))
-    fig, axes = plt.subplots(nrows, cols, figsize=(ax_size * cols, ax_size * nrows), squeeze=False)
+    fig, axes = plt.subplots(nrows, cols, figsize=(4 * cols, 4 * nrows), squeeze=False)
     for ax, it in zip(axes.flat, picks):
-        img = it["image"] if "image" in it else window_image(ctx, it["window_start_frame"], lut, enc=enc)
+        img = window_image(ctx, it["window_start_frame"], enc=enc)
         ax.imshow(img, cmap="gray", vmin=0, vmax=255, interpolation="nearest")
         for c, x0, y0, x1, y1 in it["labels"].tolist():
             color = "red" if c == it["anchor_class"] else "orange"
             ax.add_patch(plt.Rectangle((x0 - 0.5, y0 - 0.5), x1 - x0, y1 - y0, fill=False, ec=color, lw=1.2))
-        if ctx is not None and "edge_margin" in ctx:  # border between the invalid strips and the valid zone
+        if "edge_margin" in ctx:  # border between the invalid strips and the valid zone
             for xb in (ctx["edge_margin"] - 0.5, img.shape[1] - ctx["edge_margin"] - 0.5):
                 ax.axvline(xb, color="cyan", lw=0.8, ls="--")
         ax.set_title(f"{it['split']} f={it['window_start_frame']} n={len(it['labels'])} unlabelled={it['n_sliver']}"
@@ -1133,7 +1059,6 @@ def write_dataset(cfg, ctx, stage_items):
     stats["unit_visible_fraction"] = {str(u): round(float(visible_fraction[k]), 3) for k, u in enumerate(unit_ids)}
     stats["sorted_spikes_seen"] = int(ctx["unit_total"].sum())
     stats["sorted_spikes_visible"] = int(ctx["unit_visible"].sum())
-    stats["dedupe"] = ctx.get("dedupe", {})
     stats["window_search"] = ctx.get("window_counts", {})
 
     seg = ctx["recording_bp"]._recording_segments[0]
@@ -1144,19 +1069,19 @@ def write_dataset(cfg, ctx, stage_items):
              noise_sigma_uv_image_order=ctx["sigma"], bandpass_coeff=np.asarray(seg.coeff),
              whitening_matrix=ctx["whiten_W"])
     np.savez(root / "unit_templates.npz", templates_uv=ctx["templates"], boxes=boxes, peak_row=ctx["peak_row"],
-             tail_after=ctx["tail_after"], center_dt=ctx["center_dt"], unit_ids=np.array([str(u) for u in unit_ids]),
+             center_dt=ctx["center_dt"], unit_ids=np.array([str(u) for u in unit_ids]),
              class_names=np.array(class_names))
     (root / "channel_order.csv").write_text("channel_id,x_um,y_um\n" + ctx["order_text"] + "\n", encoding="utf-8")
     with (root / "class_map.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["class_id", "class_name", "unit_id", "template_source", "spike_count", "box_left", "box_right",
                          "box_top_row", "box_bottom_row", "center_dt", "stored_timing_shift", "timing_spikes", "template_spikes",
-                         "dedupe_removed", "tail_after", "visible_fraction"])
+                         "visible_fraction"])
         for k, u in enumerate(unit_ids):
             writer.writerow([k, class_names[k], u, ctx["template_source"][k], int(ctx["unit_spike_count"][k]),
                              *boxes[k].tolist(), int(ctx["center_dt"][k]), int(ctx["timing_shift"][k]),
                              int(ctx["timing_spikes"][k]), int(ctx["template_spikes"][k]),
-                             ctx.get("dedupe", {}).get("removed_per_unit", {}).get(class_names[k], 0), int(ctx["tail_after"][k]), round(float(visible_fraction[k]), 3)])
+                             round(float(visible_fraction[k]), 3)])
     asinh_formula = "round(127.5*(1+asinh(clip(v_uV,-vmax,vmax)/knee)/asinh(vmax/knee)))"
     mapping = {"knee_uv": cfg.gray_knee_uv, "vmax_uv": cfg.gray_vmax_uv, "formula": asinh_formula}
     if cfg.image_mode == "rgb":
@@ -1205,7 +1130,7 @@ def write_dataset(cfg, ctx, stage_items):
         "splits_frames": ctx["intervals"],
         "split_gap_s": cfg.split_gap_s,
         "chunks": ctx["chunks"],
-        "label_policy": {"labels": "every sorted spike (after dedupe) whose box centre lies in the valid zone "
+        "label_policy": {"labels": "every sorted spike whose box centre lies in the valid zone "
                                    "(columns edge_margin .. window - edge_margin - 1); spikes centred in the edge "
                                    "strips are never labelled; windows with a centre within edge_band samples of "
                                    "the strip border are not used; boxes centred on the template peak",
@@ -1214,9 +1139,9 @@ def write_dataset(cfg, ctx, stage_items):
                          "deployment_stride_without_duplicates": cfg.window - 2 * ctx["edge_margin"],
                          **{k: getattr(cfg, k) for k in (
             "box_fraction", "box_min_sigma", "box_min_half_width", "visible_sigma", "center_search",
-            "center_min_spikes", "template_max_per_chunk", "template_min_spikes", "dedupe_max_lag", "dedupe_iou", "dedupe_min_template_corr",
+            "center_min_spikes", "template_max_per_chunk", "template_min_spikes",
             "template_before", "template_after", "edge_band",
-            "tail_fraction", "negative_fraction", "negative_margin", "stage3_stride")}},
+            "negative_fraction", "negative_margin", "stage3_stride")}},
         "config": asdict(cfg),
         "versions": {"python": sys.version.split()[0], "platform": platform.platform(), "numpy": np.__version__,
                      "scipy": scipy.__version__, "spikeinterface": spikeinterface.__version__,
@@ -1254,7 +1179,6 @@ def main():
     parser.add_argument("--image-mode", choices=IMAGE_MODES, nargs="+", default=None,
                         help="one or more encodings; each gets its own build folder with the same windows")
     parser.add_argument("--cache-dir", default=None, help="where the ~12 GB preprocessed copy is kept")
-    parser.add_argument("--pass1-fraction", type=float, default=None)
     parser.add_argument("--stage3", action="store_true", help="also build stage 3 (sliding window, large)")
     args = parser.parse_args()
     cfg = Config()
@@ -1269,8 +1193,6 @@ def main():
         cfg.image_mode = args.image_mode[0]
     if args.cache_dir:
         cfg.cache_dir = args.cache_dir
-    if args.pass1_fraction is not None:
-        cfg.pass1_fraction = args.pass1_fraction
     if args.stage3:
         cfg.build_stage3 = True
     if args.output_root:
