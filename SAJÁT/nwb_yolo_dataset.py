@@ -1,67 +1,19 @@
 """Build staged YOLO26 detection datasets from the filtered NWB recording.
 
-Images are 128 channels (rows, geometry order) x 128 samples (columns) of the
-SpikeInterface bandpass + global-median-CMR signal, mapped to uint8 with ONE
-fixed asinh curve in microvolts (no per-window / per-chunk normalisation).
-Because the SpikeInterface pipeline stays int16 (0.195 uV/bit), the mapping is
-saved as an exact 65536-entry lookup table that deployment preprocessing
-(e.g. the Edge TPU host) can reuse.  Image modes:
-  gray  the asinh curve of the bandpass + CMR signal, 8-bit gray
-  rgb   R = the gray image, G = the WHITENED signal (third SpikeInterface step: `whiten`, local,
-        matrix estimated on the train part; fixed asinh curve in noise units), B = Teager-Kaiser
-        (NEO) energy x[t]^2 - x[t-1]x[t+1] of the bandpass + CMR signal (asinh).
-        Whitening is one fixed channel-mixing matrix per recording, so it is applied to each
-        window when it is rendered (no second cache); G and B are not lookup tables.
+Images are 128 channels x 128 samples of the bandpass + median-referenced signal.
+gray: fixed asinh curve.  rgb: R = gray, G = whitened signal, B = NEO energy.
+Labels come from the spike sorting, with one centred box per unit.
 
-Labels come from the spike sorting: every sorted spike is a label candidate (no visibility
-filter).  Boxes are per unit and come from templates AVERAGED FROM THE RECORDING (train chunks,
-the same preprocessing as the images): the box is CENTRED on the template peak (time and
-channel), symmetric, and wide/tall enough to cover every sample above ``box_fraction`` x
-peak.  Units with fewer than ``template_min_spikes`` averaged spikes fall back to the NWB units
-table's mean waveform (``mean_waveform_all_channels_filt``), moved ~1 sample to the peak time
-measured here.
-
-Edge rule, the same in every stage: each picture has an invalid strip at its left and right
-edge, ``edge_margin`` samples wide = half the widest box (rounded up).  A spike is labelled
-only if the CENTRE of its box lies in the valid zone between the strips; a spike centred in a
-strip (or outside the picture) is never labelled, even when it is fully visible.  So every
-labelled box lies completely inside the picture, and windows stepped by ``window - 2 x
-edge_margin`` samples label every spike exactly once.  A centre within ``edge_band`` samples of
-the border line between strip and valid zone is ambiguous: such a window is not used.
-
-Stages (the same chronological split intervals for all three; each contains the earlier ones):
-  stage1_single_spike    exactly one labelled spike (others may be visible in the strips, unlabelled)
-  stage2_up_to_3_spikes  stage 1 + windows with 2-3 labelled spikes
-  stage3_any_spike_count stage 2 + a sliding window (stride ``stage3_stride``), any count;
-                         only written with ``build_stage3`` (``--stage3``), it is large
-Windows are found in the list of spikes ordered by box centre.  For an anchor spike, or a group
-of 2-3 consecutive spikes, the window starts that put its centres in the valid zone and every
-other centre outside it (and outside the border band) form one interval computed from the two
-neighbours; one random start in it is the jitter, so a labelled spike lies anywhere in the
-valid zone, not in the middle.  Stages are cumulative.
-
-Every stage also gets ``negative_fraction`` negatives (empty label file): windows
-with no sorted spike within ``negative_margin`` samples and no sample beyond
-``visible_sigma`` on any channel, so unsorted spikes never appear as "nothing".
-
-Speed: the NWB stores the signal as gzip blocks of 195 s, so every small read
-decompresses a whole block.  ``prepare`` therefore writes the preprocessed int16
-signal ONCE to ``cache_dir`` (~12 GB, reused by every later build with the same
-filter settings) and all passes memory-map it.  Pass 2 only returns window
-positions and labels; images are rendered at write time, once per window, and
-hard-linked into every stage that uses them.  Because rendering is separate from
-window selection, several image modes can be written from one selection.
-
-The steps are separate functions so the sanity-check notebook
-(nwb_yolo_dataset_steps.ipynb) can run and inspect them one by one:
-    ctx = prepare(cfg); run_pass1(cfg, ctx); run_pass2(cfg, ctx);
-    stage_items = select_items(cfg, ctx); write_dataset(cfg, ctx, stage_items)
+Stages (cumulative):
+  stage1_single_spike     one labelled spike
+  stage2_up_to_3_spikes   adds windows with 2-3 labelled spikes
+  stage3_any_spike_count  adds sliding windows (--stage3)
 
 Usage (spike env):
-    python nwb_yolo_dataset.py                          # full build
-    python nwb_yolo_dataset.py --quick                  # small smoke-test build
-    python nwb_yolo_dataset.py --image-mode gray rgb    # same windows, both encodings
-    python nwb_yolo_dataset.py --stage3                 # also the (large) sliding-window stage 3
+    python nwb_yolo_dataset.py                        # full build
+    python nwb_yolo_dataset.py --quick                # small test build
+    python nwb_yolo_dataset.py --image-mode gray rgb  # both encodings
+    python nwb_yolo_dataset.py --stage3               # also stage 3
 """
 
 from __future__ import annotations
@@ -85,7 +37,6 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-STAGES = ("stage1_single_spike", "stage2_up_to_3_spikes", "stage3_any_spike_count")
 SPLITS = ("train", "val", "test")
 # Default data folder = two levels above this file (yolo26/, next to the yolo26neuro repo): the NWB and
 # DATASETS/ live there on every computer.  NFC: macOS gives "Ö" decomposed, the cache key stores it composed.
@@ -147,25 +98,20 @@ class Config:
     # trace (+-center_search samples) when at least center_min_spikes spikes were seen.
     center_search: int = 5
     center_min_spikes: int = 20
-    # Statistics and negatives only (labels do not depend on it): a spike is "weak" if its
-    # trough on the peak channel stays below visible_sigma x noise, and negatives have no
-    # sample beyond it.
+    # Negatives have no sample beyond visible_sigma x noise on any channel.
     visible_sigma: float = 5.0
-    # Edge rule (all stages): the picture has an invalid strip of edge_margin samples at its left
-    # and right edge; a spike is labelled only if its box centre lies between the strips.
-    # None = half the widest box, rounded up, so no labelled box is ever cut.  A centre within
-    # edge_band samples of the border between strip and valid zone is ambiguous: the window
-    # is not used (stages 1-2 never choose such a start, stage 3 drops the tile).
-    edge_margin: int | None = None
+    # Edge rule (all stages): the picture has an invalid strip at its left and right edge, half the
+    # widest box wide (rounded up), and a spike is labelled only if its box centre lies between the
+    # strips.  A centre within edge_band samples of the border between strip and valid zone is
+    # ambiguous: the window is not used (stages 1-2 never choose such a start, stage 3 drops the tile).
     edge_band: int = 2
     # Negatives (empty label file): no sorted spike within negative_margin samples of the
     # window and no sample beyond visible_sigma on any channel.  negative_fraction is the
-    # share of each split's images, per stage.
-    negative_fraction: dict = field(default_factory=lambda: {s: 0.10 for s in STAGES})
+    # share of each split's images.
+    negative_fraction: float = 0.10
     negative_margin: int = 40
-    # Sampling.  None = no cap (balancing per unit waits for the classification step).
-    # At most this many windows per (split, unit, label count); None = no cap.  These are the Nov 12 build values.
-    max_per_unit_count: dict | None = field(default_factory=lambda: {"train": 600, "val": 150, "test": 150})
+    # At most this many windows per (split, unit, label count); None = no cap.
+    max_per_unit_count: dict | None = None
     # Stage 3: sliding window over each chunk; large, so only built when asked.
     build_stage3: bool = False
     stage3_stride: int = 64
@@ -269,9 +215,6 @@ def ensure_cache(cfg, uv_per_bit, fs, dset_name, shape, block_frames):
     if meta_path.exists() and pp_path.exists() and pp_path.stat().st_size == nbytes:
         old = json.loads(meta_path.read_text())
         verified = old.pop("spikeinterface_verified", [])
-        if "spikeinterface" in old:  # meta.json written before the major.minor key
-            verified.append(old.pop("spikeinterface"))
-            old["spikeinterface_minor"] = ".".join(verified[-1].split(".")[:2])
         if old == key:
             return pp_path, ("reused" if version in verified else "verify")
         changed = {k: (old.get(k), key.get(k)) for k in key.keys() | old.keys() if old.get(k) != key.get(k)}
@@ -312,9 +255,6 @@ def record_cache_version(pp_path):
     meta_path = Path(pp_path).parent / "meta.json"
     meta = json.loads(meta_path.read_text())
     verified = meta.pop("spikeinterface_verified", [])
-    if "spikeinterface" in meta:
-        verified.append(meta.pop("spikeinterface"))
-        meta["spikeinterface_minor"] = ".".join(verified[-1].split(".")[:2])
     meta["spikeinterface_verified"] = sorted(set(verified) | {spikeinterface.__version__})
     meta_path.write_text(json.dumps(meta, indent=1))
 
@@ -336,16 +276,9 @@ def gray_lut(uv_per_bit, knee_uv, vmax_uv):
 IMAGE_MODES = ("gray", "rgb")
 
 
-def make_lut(cfg, uv_per_bit):
-    """The gray lookup table; in rgb mode it is the R channel."""
-    if cfg.image_mode not in IMAGE_MODES:
-        raise ValueError(f"Unknown image_mode {cfg.image_mode!r}")
-    return gray_lut(uv_per_bit, cfg.gray_knee_uv, cfg.gray_vmax_uv)
-
-
 def make_encoder(cfg, ctx):
     """Everything needed to turn int16 traces into an image (picklable, for the workers)."""
-    enc = {"mode": cfg.image_mode, "lut": make_lut(cfg, ctx["uv_per_bit"])}
+    enc = {"mode": cfg.image_mode, "lut": ctx["lut"]}
     if cfg.image_mode == "rgb":
         o = ctx["order"]
         enc.update({
@@ -444,16 +377,13 @@ def _pass2_chunk(task):
     # (n_units, 4): left, right (samples from the sorted spike frame), top row, bottom row + 1;
     # the box centre is frame + center_dt (the template peak), the box symmetric around it.
     boxes, center_dt = _W["boxes"], _W["center_dt"]
-    peak_row, peak_sign = _W["peak_row"], _W["peak_sign"]
     margin, band = _W["edge_margin"], _W["edge_band"]
     lab_lo, lab_hi = margin + band, W - margin - band  # labelled:   lab_lo <= centre column < lab_hi
     out_lo, out_hi = margin - band, W - margin + band  # unlabelled: centre column < out_lo or >= out_hi
-    n_units = len(boxes)
     pad = W // 2
     ws_min, ws_max = pad, T - pad - W  # every window lies inside the chunk, away from its edges
 
-    # Sorted events in the chunk, ordered by box centre, and whether their trough on the peak
-    # channel clears visible_sigma ("weak" otherwise; statistics only).
+    # Sorted events in the chunk, ordered by box centre.
     frames, classes = _W["event_frames"], _W["event_classes"]
     lo, hi = np.searchsorted(frames, [start, end])
     ev_t = (frames[lo:hi] - start).astype(np.int64)
@@ -463,9 +393,6 @@ def _pass2_chunk(task):
     by_centre = np.argsort(ev_t + center_dt[ev_k], kind="stable")
     ev_t, ev_k = ev_t[by_centre], ev_k[by_centre]
     c = ev_t + center_dt[ev_k]                                       # box centre (sample in the chunk)
-    rows = peak_row[ev_k]
-    trough = np.stack([z[rows, ev_t + d] for d in range(-3, 4)], axis=1)
-    ev_vis = (trough * peak_sign[ev_k][:, None]).max(axis=1) >= _W["visible_sigma"]
     n = len(ev_t)
 
     x0 = ev_t - boxes[ev_k, 0]                                       # box [x0, x1)
@@ -476,8 +403,7 @@ def _pass2_chunk(task):
     def window_objects(ws):
         """Labels (class, x0, y0, x1, y1) for the window starting at ws.  Returns the labels, the
         number of visible but unlabelled spikes (centre in a strip or outside the picture), the
-        number of ambiguous spikes (centre in a border band), the labelled spike indices and
-        how many labels are weak."""
+        number of ambiguous spikes (centre in a border band) and the labelled spike indices."""
         a, b = np.searchsorted(c, [ws - reach, ws + W + reach])
         rel = c[a:b] - ws
         labelled = (rel >= lab_lo) & (rel < lab_hi)
@@ -485,8 +411,7 @@ def _pass2_chunk(task):
         visible = (x1[a:b] > ws) & (x0[a:b] < ws + W)
         li = np.arange(a, b)[labelled]
         lab = np.stack([ev_k[li], np.clip(x0[li] - ws, 0, W), y0[li], np.clip(x1[li] - ws, 0, W), y1[li]], axis=1)
-        return (lab, int((visible & ~labelled & ~ambiguous).sum()), int(ambiguous.sum()), li,
-                int((~ev_vis[li]).sum()))
+        return lab, int((visible & ~labelled & ~ambiguous).sum()), int(ambiguous.sum()), li
 
     def interval(i, j):
         """Window starts [lo, hi] that label exactly the spikes i..j: their centres in the valid
@@ -504,13 +429,13 @@ def _pass2_chunk(task):
 
     def add(kind, i, j, lo_, hi_):
         ws = int(rng.integers(lo_, hi_ + 1))
-        labels, n_unlab, n_ambig, members, n_weak = window_objects(ws)
+        labels, n_unlab, n_ambig, members = window_objects(ws)
         if n_ambig or members.tolist() != list(range(i, j + 1)):
             counts["plan_mismatch"] += 1  # must stay 0: the interval guarantees exactly this content
             return False
         items.append({
             "kind": kind, "split": split, "labels": labels, "window_start_frame": start + ws,
-            "anchor_class": int(ev_k[i]), "n_labels": len(labels), "n_sliver": n_unlab, "n_weak": n_weak,
+            "anchor_class": int(ev_k[i]), "n_labels": len(labels), "n_sliver": n_unlab,
             "jitter_lo": start + lo_, "jitter_hi": start + hi_,
         })
         return True
@@ -536,7 +461,7 @@ def _pass2_chunk(task):
         tiles = np.arange(ws_min + int(rng.integers(0, stride)), ws_max + 1, stride)
         for ws in rng.permutation(tiles)[:stage3_cap]:
             ws = int(ws)
-            labels, n_unlab, n_ambig, _, n_weak = window_objects(ws)
+            labels, n_unlab, n_ambig, _ = window_objects(ws)
             if n_ambig:
                 counts["stage3_ambiguous_dropped"] += 1
                 continue
@@ -545,7 +470,7 @@ def _pass2_chunk(task):
             items.append({
                 "kind": "tile", "split": split, "labels": labels,
                 "window_start_frame": start + ws, "anchor_class": -1, "n_labels": len(labels),
-                "n_sliver": n_unlab, "n_weak": n_weak, "jitter_lo": start + ws, "jitter_hi": start + ws,
+                "n_sliver": n_unlab, "jitter_lo": start + ws, "jitter_hi": start + ws,
             })
 
     # Negatives: non-overlapping windows at a random phase with no sorted spike (visible or
@@ -560,12 +485,10 @@ def _pass2_chunk(task):
         items.append({
             "kind": "negative", "split": split,
             "labels": np.zeros((0, 5), np.int64), "window_start_frame": start + ws, "anchor_class": -1,
-            "n_labels": 0, "n_sliver": 0, "n_weak": 0, "jitter_lo": start + ws, "jitter_hi": start + ws,
+            "n_labels": 0, "n_sliver": 0, "jitter_lo": start + ws, "jitter_hi": start + ws,
         })
 
-    unit_total = np.bincount(ev_k, minlength=n_units)
-    unit_visible = np.bincount(ev_k[ev_vis], minlength=n_units)
-    return items, unit_total, unit_visible, counts
+    return items, counts
 
 
 # --------------------------------------------------------------------------- build steps
@@ -632,7 +555,6 @@ def build_templates(cfg, stored, sigma, shift=None, recomputed=None):
     n_units, n_rows, _ = templates.shape
     boxes = np.zeros((n_units, 4), np.int64)
     peak_row = np.zeros(n_units, np.int64)
-    peak_sign = np.zeros(n_units, np.float32)
     center_dt = np.zeros(n_units, np.int64)
     for k in range(n_units):
         absw = np.abs(templates[k])
@@ -641,7 +563,7 @@ def build_templates(cfg, stored, sigma, shift=None, recomputed=None):
         near = absw[:, center - 5:center + 6]
         r, t = np.unravel_index(np.argmax(near), near.shape)
         t += center - 5
-        peak_row[k], peak_sign[k], center_dt[k] = r, np.sign(templates[k][r, t]), t - center
+        peak_row[k], center_dt[k] = r, t - center
         thr = np.maximum(cfg.box_fraction * absw[r, t], cfg.box_min_sigma * sigma)
         mask = absw >= thr[:, None]
         if not mask[r, t]:  # peak below 3 sigma (or sigma NaN): keep the peak so the box is never empty
@@ -657,7 +579,7 @@ def build_templates(cfg, stored, sigma, shift=None, recomputed=None):
         hh = max(r - rr.min(), rr.max() - r)
         dt = int(center_dt[k])
         boxes[k] = (hw - dt, hw + dt, max(r - hh, 0), min(r + hh + 1, n_rows))
-    return templates, boxes, peak_row, peak_sign, center_dt
+    return templates, boxes, peak_row, center_dt
 
 
 def prepare(cfg: Config):
@@ -756,7 +678,7 @@ def prepare(cfg: Config):
         "event_frames": frames[o], "event_classes": classes[o], "stored": stored,
         "unit_spike_count": np.bincount(classes, minlength=len(unit_ids)),
         "intervals": intervals, "chunks": chunks,
-        "lut": make_lut(cfg, uv_per_bit),
+        "lut": gray_lut(uv_per_bit, cfg.gray_knee_uv, cfg.gray_vmax_uv),
     }
 
 
@@ -769,7 +691,6 @@ def worker_state(cfg, ctx):
     if "boxes" in ctx:
         state.update({
             "seed": cfg.seed, "sigma": ctx["sigma"], "boxes": ctx["boxes"], "center_dt": ctx["center_dt"],
-            "peak_row": ctx["peak_row"], "peak_sign": ctx["peak_sign"],
             "visible_sigma": cfg.visible_sigma,
             "edge_margin": ctx["edge_margin"], "edge_band": cfg.edge_band,
             "negative_margin": cfg.negative_margin,
@@ -801,7 +722,7 @@ def run_pass1(cfg, ctx):
     measured = np.abs(sums).argmax(axis=1) - h  # peak of the averaged peak-row trace, from the sorted frame
     data_dt = np.where(counts >= cfg.center_min_spikes, measured, stored_dt)
     shift = stored_dt - data_dt  # > 0: the stored waveform is late, move it earlier (fallback units)
-    templates, boxes, peak_row, peak_sign, center_dt = build_templates(
+    templates, boxes, peak_row, center_dt = build_templates(
         cfg, ctx["stored"], sigma, shift, recomputed)
     source = ["recomputed" if recomputed[k] is not None
               else ("nwb_mean_waveform" if shift[k] == 0 else f"nwb_mean_waveform_shifted_{int(shift[k]):+d}")
@@ -818,11 +739,11 @@ def run_pass1(cfg, ctx):
             "times do not line up with the signal. Check the SpikeInterface version (0.104.x), the sorting's "
             "sampling frequency / t_start, and delete the cache folder if it was copied from another computer.")
     widest =int((boxes[:, 0] + boxes[:, 1] + 1).max())
-    edge_margin = cfg.edge_margin if cfg.edge_margin is not None else (widest + 1) // 2
+    edge_margin = (widest + 1) // 2
     if 2 * (edge_margin + cfg.edge_band) >= cfg.window:
         raise ValueError(f"edge_margin {edge_margin} leaves no valid zone in a {cfg.window}-sample window")
     ctx.update({"sigma": sigma, "templates": templates, "boxes": boxes, "peak_row": peak_row,
-                "peak_sign": peak_sign, "center_dt": center_dt, "template_source": source,
+                "center_dt": center_dt, "template_source": source,
                 "timing_shift": np.where([r is None for r in recomputed], shift, 0), "timing_spikes": counts,
                 "template_spikes": tcount, "edge_margin": int(edge_margin)})
     print(f"templates: {n_units - len(fallback)} units averaged from the recording "
@@ -850,20 +771,15 @@ def pass2_tasks(cfg, ctx):
 def run_pass2(cfg, ctx):
     """Candidate images and labels for all planned chunks."""
     by_kind = {"anchored": [], "group": [], "tile": [], "negative": []}
-    unit_total = np.zeros(len(ctx["unit_ids"]), np.int64)
-    unit_visible = np.zeros(len(ctx["unit_ids"]), np.int64)
     rejects = {}
     with ProcessPoolExecutor(cfg.workers, initializer=_init_worker, initargs=(worker_state(cfg, ctx),)) as pool:
-        for items, tot, vis, rej in pool.map(_pass2_chunk, pass2_tasks(cfg, ctx)):
+        for items, rej in pool.map(_pass2_chunk, pass2_tasks(cfg, ctx)):
             for it in items:
                 by_kind[it["kind"]].append(it)
-            unit_total += tot
-            unit_visible += vis
             for r, c in rej.items():
                 rejects[r] = rejects.get(r, 0) + c
     ctx.update({"anchored": by_kind["anchored"], "groups": by_kind["group"], "tiles": by_kind["tile"],
-                "negatives": by_kind["negative"], "unit_total": unit_total, "unit_visible": unit_visible,
-                "window_counts": rejects})
+                "negatives": by_kind["negative"], "window_counts": rejects})
     if rejects.get("plan_mismatch"):
         raise RuntimeError(f"{rejects['plan_mismatch']} windows did not contain exactly their planned spikes")
     print(f"window search: {rejects}", flush=True)
@@ -896,7 +812,7 @@ def select_items(cfg, ctx):
         for split in SPLITS:
             full = [it for it in ctx["tiles"] if it["split"] == split]
             cap = None if cfg.stage3_max_images is None else int(round(
-                cfg.stage3_max_images[split] * (1 - cfg.negative_fraction["stage3_any_spike_count"])))
+                cfg.stage3_max_images[split] * (1 - cfg.negative_fraction)))
             tiles += [full[i] for i in rng.permutation(len(full))[:cap]]
         new["stage3_any_spike_count"] = tiles
 
@@ -907,7 +823,7 @@ def select_items(cfg, ctx):
     stage_items, so_far, n_neg = {}, [], {sp: 0 for sp in SPLITS}
     for stage_name, items in new.items():
         so_far = so_far + items
-        frac = cfg.negative_fraction[stage_name]
+        frac = cfg.negative_fraction
         for split in SPLITS:
             n_new = sum(it["split"] == split for it in items)
             want = n_neg[split] + int(round(n_new * frac / (1 - frac)))
@@ -935,7 +851,6 @@ def stage_stats(items, n_units):
             "label_count_histogram": {int(c): int(n) for c, n in zip(*np.unique(n_labels, return_counts=True))},
             "classes_present": f"{len(np.unique(cls))}/{n_units}",
             "images_with_unlabelled_slivers": int(sum(it["n_sliver"] > 0 for it in its)),
-            "weak_labels": int(sum(it["n_weak"] for it in its)),
         }
     return per_split
 
@@ -965,7 +880,7 @@ def write_stage(stage_dir, items, class_names, cfg, pool_dir, height):
                 "split": split, "image": f"images/{split}/{stem}.png",
                 "window_start_frame": it["window_start_frame"], "kind": it["kind"],
                 "anchor_class": it["anchor_class"], "n_labels": len(it["labels"]),
-                "n_sliver_unlabelled": it["n_sliver"], "n_weak_labelled": it["n_weak"], "jitter_lo_frame": it["jitter_lo"], "jitter_hi_frame": it["jitter_hi"],
+                "n_sliver_unlabelled": it["n_sliver"], "jitter_lo_frame": it["jitter_lo"], "jitter_hi_frame": it["jitter_hi"],
                 "classes": " ".join(str(c) for c in it["labels"][:, 0].tolist()),
             })
     with (stage_dir / "manifest.csv").open("w", newline="", encoding="utf-8") as f:
@@ -1055,10 +970,6 @@ def write_dataset(cfg, ctx, stage_items):
         plot_items(items, stage_name, cfg.preview_count, preview_rng, ctx=ctx, enc=enc,
                    path=root / f"preview_{stage_name}.png")
         stats["stages"][stage_name] = stage_stats(items, len(unit_ids))
-    visible_fraction = ctx["unit_visible"] / np.maximum(ctx["unit_total"], 1)
-    stats["unit_visible_fraction"] = {str(u): round(float(visible_fraction[k]), 3) for k, u in enumerate(unit_ids)}
-    stats["sorted_spikes_seen"] = int(ctx["unit_total"].sum())
-    stats["sorted_spikes_visible"] = int(ctx["unit_visible"].sum())
     stats["window_search"] = ctx.get("window_counts", {})
 
     seg = ctx["recording_bp"]._recording_segments[0]
@@ -1075,73 +986,19 @@ def write_dataset(cfg, ctx, stage_items):
     with (root / "class_map.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["class_id", "class_name", "unit_id", "template_source", "spike_count", "box_left", "box_right",
-                         "box_top_row", "box_bottom_row", "center_dt", "stored_timing_shift", "timing_spikes", "template_spikes",
-                         "visible_fraction"])
+                         "box_top_row", "box_bottom_row", "center_dt", "stored_timing_shift", "timing_spikes", "template_spikes"])
         for k, u in enumerate(unit_ids):
             writer.writerow([k, class_names[k], u, ctx["template_source"][k], int(ctx["unit_spike_count"][k]),
                              *boxes[k].tolist(), int(ctx["center_dt"][k]), int(ctx["timing_shift"][k]),
-                             int(ctx["timing_spikes"][k]), int(ctx["template_spikes"][k]),
-                             round(float(visible_fraction[k]), 3)])
-    asinh_formula = "round(127.5*(1+asinh(clip(v_uV,-vmax,vmax)/knee)/asinh(vmax/knee)))"
-    mapping = {"knee_uv": cfg.gray_knee_uv, "vmax_uv": cfg.gray_vmax_uv, "formula": asinh_formula}
-    if cfg.image_mode == "rgb":
-        mapping = {
-            "R": {**mapping, "lut": "gray_lut_int16.npy"},
-            "G": {"formula": "round(127.5*(1+asinh(clip(w,-vmax,vmax)/knee)/asinh(vmax/knee))), w = whitened signal "
-                             "= int16 traces (NWB column order) @ whitening_matrix, in noise sd",
-                  "knee_sd": cfg.rgb_white_knee_sd, "vmax_sd": cfg.rgb_white_vmax_sd,
-                  "matrix": "preprocessing_arrays.npz:whitening_matrix"},
-            "B": {"formula": "round(255*asinh(clip(e,0,vmax)/knee)/asinh(vmax/knee)), e = v[t]^2 - v[t-1]*v[t+1] in uV^2",
-                  "knee_uv2": cfg.rgb_neo_knee_uv2, "vmax_uv2": cfg.rgb_neo_vmax_uv2,
-                  "note": "needs one sample before and after the window"},
-            "lut_covers": "R only",
-        }
+                             int(ctx["timing_spikes"][k]), int(ctx["template_spikes"][k])])
     preprocessing = {
         "build_id": build_id,
         "nwb": {"path": cfg.nwb_path, "size_bytes": os.path.getsize(cfg.nwb_path), "series_unit": ctx["nwb_unit"],
                 "uv_per_bit": ctx["uv_per_bit"], "sampling_frequency_hz": ctx["fs"], "num_frames": ctx["num_frames"]},
-        "pipeline": [
-            {"step": "set_channel_gains", "uv_per_bit": ctx["uv_per_bit"], "offset": 0.0},
-            {"step": "bandpass_filter",
-             **{k: v for k, v in ctx["recording_bp"]._kwargs.items() if k != "recording"},
-             "filter_mode": getattr(seg, "filter_mode", None), "direction": getattr(seg, "direction", None),
-             "coefficients": "preprocessing_arrays.npz:bandpass_coeff",
-             "note": "SpikeInterface default Butterworth, zero-phase; margin_ms reads extra samples on both sides "
-                     "(needs that much look-ahead online); output cast back to int16"},
-            {"step": "common_reference",
-             **{k: v for k, v in ctx["recording_pp"]._kwargs.items() if k != "recording"},
-             "note": "median over all 128 channels per sample, subtracted, cast to int16"},
-            {"step": "whiten", "used_by": "rgb mode, G channel",
-             "function": "spikeinterface whiten(mode='local', dtype='float32')", "radius_um": cfg.whiten_radius_um,
-             "matrix": "preprocessing_arrays.npz:whitening_matrix",
-             "note": "matrix estimated on the train part of the bandpass + CMR signal (int16 units), then fixed; "
-                     "whitened = traces_int16 @ matrix; one matrix product per sample, no look-ahead"},
-            {"step": "reorder_channels", "rule": "lexsort by (-y, x): top of probe first, then horizontal (= raw NWB order)",
-             "channel_order_sha256": ctx["order_hash"], "file": "channel_order.csv"},
-            {"step": "gray_mapping", "image_mode": cfg.image_mode, **mapping,
-             "lut": "gray_lut_int16.npy", "lut_shape": list(lut.shape),
-             "lut_index": "int16 value + 32768", "lut_sha256": hashlib.sha256(lut.tobytes()).hexdigest(),
-             "normalisation": "none (no per-window, per-chunk or per-channel scaling)"},
-        ],
-        "image": {"height": "channels (image order)", "width": "samples", "size": cfg.window, "dtype": "uint8",
-                  "channels": 3 if cfg.image_mode != "gray" else 1},
-        "images_cut_from": {"cache": ctx["cache_path"], "note": "int16 copy of exactly this pipeline "
-                            "(bandpass_filter -> common_reference) over the whole recording, written once"},
         "splits_frames": ctx["intervals"],
         "split_gap_s": cfg.split_gap_s,
         "chunks": ctx["chunks"],
-        "label_policy": {"labels": "every sorted spike whose box centre lies in the valid zone "
-                                   "(columns edge_margin .. window - edge_margin - 1); spikes centred in the edge "
-                                   "strips are never labelled; windows with a centre within edge_band samples of "
-                                   "the strip border are not used; boxes centred on the template peak",
-                         "edge_margin": ctx["edge_margin"],
-                         "valid_zone_columns": [ctx["edge_margin"], cfg.window - ctx["edge_margin"] - 1],
-                         "deployment_stride_without_duplicates": cfg.window - 2 * ctx["edge_margin"],
-                         **{k: getattr(cfg, k) for k in (
-            "box_fraction", "box_min_sigma", "box_min_half_width", "visible_sigma", "center_search",
-            "center_min_spikes", "template_max_per_chunk", "template_min_spikes",
-            "template_before", "template_after", "edge_band",
-            "negative_fraction", "negative_margin", "stage3_stride")}},
+        "label_policy": {"edge_margin": ctx["edge_margin"]},
         "config": asdict(cfg),
         "versions": {"python": sys.version.split()[0], "platform": platform.platform(), "numpy": np.__version__,
                      "scipy": scipy.__version__, "spikeinterface": spikeinterface.__version__,
