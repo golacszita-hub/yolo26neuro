@@ -47,72 +47,47 @@ DATA_ROOT = Path(unicodedata.normalize("NFC", str(Path(__file__).resolve().paren
 class Config:
     nwb_path: str = str(DATA_ROOT / "Rat01_Insertion2_Depth2.nwb")
     output_root: str = str(DATA_ROOT / "DATASETS" / "nwb_asinh_stages")
+    # Zero-phase bandpass; the margin makes the cache bit-identical to reading the NWB chain.
     freq_min: float = 300.0
     freq_max: float = 3000.0
-    # Zero-phase filter edge margin; 50 ms makes any read (128 samples or 4 s) bit-identical.
     filter_margin_ms: float = 50.0
-    # Where the preprocessed int16 copy of the recording (~12 GB) is kept; shared by all builds.
-    cache_dir: str = str(DATA_ROOT / "DATASETS" / "nwb_pp_cache")
+    cache_dir: str = str(DATA_ROOT / "DATASETS" / "nwb_pp_cache")  # ~12 GB preprocessed copy, shared by builds
     window: int = 128
-    # Fixed uV -> gray: gray = 127.5 * (1 + asinh(v / knee) / asinh(vmax / knee)).
-    # Linear (noise keeps its texture) below ~knee, logarithmic above (one gray level is
-    # ~4 % of amplitude at any size), so 30-930 uV spikes keep their shape instead of
-    # saturating.  Noise sigma is ~5 uV here.
+    # gray = 127.5 * (1 + asinh(v / knee) / asinh(vmax / knee)), v in uV (noise is ~5 uV).
     gray_knee_uv: float = 10.0
     gray_vmax_uv: float = 1000.0
-    # "gray": the asinh curve as 8-bit gray PNG.  "rgb": R = that gray image, G = the whitened
-    # signal, B = NEO energy.  YOLO's first conv takes 3 channels either way.
-    image_mode: str = "rgb"
-    # Whitening (SpikeInterface `whiten`, mode "local"): each channel is decorrelated from the
-    # electrodes within whiten_radius_um and scaled to unit noise.  G maps it with the same asinh
-    # formula in noise units (knee 2 sd, like 10 uV at ~5 uV noise).
+    image_mode: str = "rgb"  # "gray", or "rgb": R = gray, G = whitened signal, B = NEO energy
+    # rgb only: local whitening radius, and the asinh curves for G (noise sd) and B (uV^2).
     whiten_radius_um: float = 50.0
     rgb_white_knee_sd: float = 2.0
     rgb_white_vmax_sd: float = 200.0
-    # B maps NEO energy with an asinh of knee/vmax in uV^2.
     rgb_neo_knee_uv2: float = 100.0
     rgb_neo_vmax_uv2: float = 250000.0
-    # Chronological split with a gap so no window or burst straddles two splits.
+    # Chronological split with gaps; time_fraction < 1 reads only part of each split (--quick).
     train_fraction: float = 0.70
     val_fraction: float = 0.15
     split_gap_s: float = 1.0
     chunk_s: float = 4.0
-    # Fraction of each split's chunks that is read; 1.0 = the whole recording.
     time_fraction: dict = field(default_factory=lambda: {"train": 1.0, "val": 1.0, "test": 1.0})
-    # Layout of the stored NWB mean waveform: samples before / after the sorted spike frame.
+    # Templates: samples before / after the spike, averaged from up to template_max_per_chunk spikes
+    # per unit and chunk; units with fewer than template_min_spikes use the stored NWB waveform.
     template_before: int = 40
     template_after: int = 40
-    # Templates (boxes) are averaged from the recording: at most template_max_per_chunk
-    # spikes per unit and chunk (spread over the chunk); units with fewer than
-    # template_min_spikes averaged spikes fall back to the stored NWB mean waveform.
     template_max_per_chunk: int = 10
     template_min_spikes: int = 50
-    # Box: every template sample with |w| >= max(box_fraction x peak, box_min_sigma x noise)
-    # in the peak's connected component, then made symmetric around the peak; at least
-    # box_min_half_width samples to each side.
+    # Box: samples above max(box_fraction x peak, box_min_sigma x noise), symmetric around the peak.
     box_fraction: float = 0.25
     box_min_sigma: float = 3.0
     box_min_half_width: int = 2
-    # Fallback units only: the stored waveforms run ~1 sample late against this pipeline (other
-    # filter), so the stored waveform is moved to the peak of the unit's averaged peak-channel
-    # trace (+-center_search samples) when at least center_min_spikes spikes were seen.
+    # Fallback units only: align the stored waveform to the peak time measured in the recording.
     center_search: int = 5
     center_min_spikes: int = 20
-    # Negatives have no sample beyond visible_sigma x noise on any channel.
-    visible_sigma: float = 5.0
-    # Edge rule (all stages): the picture has an invalid strip at its left and right edge, half the
-    # widest box wide (rounded up), and a spike is labelled only if its box centre lies between the
-    # strips.  A centre within edge_band samples of the border between strip and valid zone is
-    # ambiguous: the window is not used (stages 1-2 never choose such a start, stage 3 drops the tile).
-    edge_band: int = 2
-    # Negatives (empty label file): no sorted spike within negative_margin samples of the
-    # window and no sample beyond visible_sigma on any channel.  negative_fraction is the
-    # share of each split's images.
+    visible_sigma: float = 5.0  # negatives have no sample beyond this x noise
+    edge_band: int = 2  # a box centre this close to an edge strip makes the window ambiguous
+    # Negatives: share of each stage's images, and the spike-free margin around each one.
     negative_fraction: float = 0.10
     negative_margin: int = 40
-    # At most this many windows per (split, unit, label count); None = no cap.
-    max_per_unit_count: dict | None = None
-    # Stage 3: sliding window over each chunk; large, so only built when asked.
+    max_per_unit_count: dict | None = None  # windows per (split, unit, label count); None = no cap
     build_stage3: bool = False
     stage3_stride: int = 64
     stage3_max_images: dict | None = field(default_factory=lambda: {"train": 40000, "val": 8000, "test": 8000})
@@ -194,10 +169,7 @@ def ensure_cache(cfg, uv_per_bit, fs, dset_name, shape, block_frames):
     median CMR, same margin) runs on that file in parallel, (3) the raw file is deleted.
     The bandpass margin makes the result bit-identical to reading the NWB chain directly;
     notebook step 11 re-checks this against the NWB.  Reused while `meta.json` matches.
-
-    Returns (path, status): "built", "reused", or "verify" = same settings and SpikeInterface
-    major.minor but a patch version not seen before (e.g. the notebook kernel and the `spike`
-    env differ); `prepare` then compares the cache with the NWB chain and records the version.
+    Returns (path, status), status "built" or "reused".
     """
     import spikeinterface
 
@@ -208,15 +180,14 @@ def ensure_cache(cfg, uv_per_bit, fs, dset_name, shape, block_frames):
         "filter_margin_ms": cfg.filter_margin_ms, "chain": "bandpass_filter -> common_reference(global, median)",
         "spikeinterface_minor": ".".join(spikeinterface.__version__.split(".")[:2]),
     }
-    version = spikeinterface.__version__
     folder = Path(cfg.cache_dir) / f"{Path(cfg.nwb_path).stem}_bp{cfg.freq_min:g}-{cfg.freq_max:g}_m{cfg.filter_margin_ms:g}_cmr"
     pp_path, meta_path = folder / "traces_pp_int16.raw", folder / "meta.json"
     nbytes = int(shape[0]) * int(shape[1]) * 2  # Python ints: np.prod overflows int32 on Windows with numpy 1.x
     if meta_path.exists() and pp_path.exists() and pp_path.stat().st_size == nbytes:
         old = json.loads(meta_path.read_text())
-        verified = old.pop("spikeinterface_verified", [])
+        old.pop("spikeinterface_verified", None)  # written by earlier versions of this script
         if old == key:
-            return pp_path, ("reused" if version in verified else "verify")
+            return pp_path, "reused"
         changed = {k: (old.get(k), key.get(k)) for k in key.keys() | old.keys() if old.get(k) != key.get(k)}
         print(f"cache {folder} was made with other settings {changed}; rebuilding it", flush=True)
 
@@ -243,20 +214,9 @@ def ensure_cache(cfg, uv_per_bit, fs, dset_name, shape, block_frames):
     with ProcessPoolExecutor(cfg.workers, initializer=_init_pp_writer, initargs=(state,)) as pool:
         list(pool.map(_write_pp, [(a, min(a + step, shape[0])) for a in range(0, shape[0], step)]))
     raw_path.unlink()
-    meta_path.write_text(json.dumps({**key, "spikeinterface_verified": [version]}, indent=1))
+    meta_path.write_text(json.dumps(key, indent=1))
     print(f"cache: preprocessed signal written to {pp_path} ({time.time() - t0:.0f} s)", flush=True)
     return pp_path, "built"
-
-
-def record_cache_version(pp_path):
-    """Remember that the cache was verified against this SpikeInterface patch version."""
-    import spikeinterface
-
-    meta_path = Path(pp_path).parent / "meta.json"
-    meta = json.loads(meta_path.read_text())
-    verified = meta.pop("spikeinterface_verified", [])
-    meta["spikeinterface_verified"] = sorted(set(verified) | {spikeinterface.__version__})
-    meta_path.write_text(json.dumps(meta, indent=1))
 
 
 def open_cache(path, shape):
@@ -616,16 +576,13 @@ def prepare(cfg: Config):
                          f"{(num_frames, recording.get_num_channels())}")
     cache_path, cache_status = ensure_cache(cfg, uv_per_bit, fs, dset_name, dset_shape, block_frames)
     traces = open_cache(cache_path, dset_shape)
-    if cache_status != "reused":  # the cache must equal the NWB chain exactly (also checked in notebook step 11)
-        if cache_status == "verify":
-            print("cache: new SpikeInterface patch version, checking the cache against the NWB chain", flush=True)
+    if cache_status == "built":  # a new cache must equal the NWB chain exactly (also checked in notebook step 11)
         seam = int(round(10 * fs))  # ensure_cache writes 10 s tasks; NWB gzip blocks are block_frames long
         for a in sorted({num_frames // 3, 37 * seam - 1000, block_frames - 1000, num_frames - 2000}):
             a = min(max(a, 0), num_frames - 2000)
             if not np.array_equal(traces[a:a + 2000], recording_pp.get_traces(start_frame=a, end_frame=a + 2000)):
                 raise RuntimeError(f"cache {cache_path} differs from the NWB preprocessing chain at frame {a}; "
                                    "delete the cache folder and rebuild")
-        record_cache_version(cache_path)
 
     channel_ids = [str(c) for c in recording.get_channel_ids()]
     locations = recording.get_channel_locations()
@@ -1030,7 +987,7 @@ def build(cfg: Config, image_modes=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--quick", action="store_true", help="small smoke-test build")
-    parser.add_argument("--nwb", default=None, help=f"NWB file (default {Config.nwb_path})")
+    parser.add_argument("--nwb", dest="nwb_path", default=None, help=f"NWB file (default {Config.nwb_path})")
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--image-mode", choices=IMAGE_MODES, nargs="+", default=None,
@@ -1044,18 +1001,13 @@ def main():
         cfg.stage3_max_images = {"train": 300, "val": 100, "test": 100}
         cfg.build_stage3 = True  # small here, so the stage-3 code is exercised
         cfg.template_min_spikes = 20  # few chunks: at most ~80 spikes per unit are averaged
-    if args.nwb:
-        cfg.nwb_path = args.nwb
-    if args.image_mode:
-        cfg.image_mode = args.image_mode[0]
-    if args.cache_dir:
-        cfg.cache_dir = args.cache_dir
     if args.stage3:
         cfg.build_stage3 = True
-    if args.output_root:
-        cfg.output_root = args.output_root
-    if args.workers:
-        cfg.workers = args.workers
+    if args.image_mode:
+        cfg.image_mode = args.image_mode[0]
+    for name in ("nwb_path", "cache_dir", "output_root", "workers"):
+        if getattr(args, name):
+            setattr(cfg, name, getattr(args, name))
     build(cfg, args.image_mode)
 
 
