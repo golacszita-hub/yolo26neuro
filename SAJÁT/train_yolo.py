@@ -35,10 +35,30 @@ class NoRectTrainer(DetectionTrainer):
         return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=False, stride=gs)
 
 
-settings.update({"wandb": True})
-wandb.init(project="spikeyolo", name=NAME)  # Ultralytics' W&B callback logs into this run and closes it
+# Log to W&B by batch: Ultralytics' own W&B callback logs only once per epoch, so it is turned off here.
+settings.update({"wandb": False})
+wandb.init(project="spikeyolo", name=NAME)
+step = 0  # batches seen so far
 
-YOLO(WEIGHTS).train(
+
+def log_batch(trainer):
+    global step
+    step += 1
+    if trainer.loss_items is not None:  # None when a batch was dropped after a CUDA out-of-memory
+        lr = {f"lr/pg{i}": g["lr"] for i, g in enumerate(trainer.optimizer.param_groups)}
+        wandb.log({**trainer.label_loss_items(trainer.loss_items, prefix="batch"), **lr, "epoch": trainer.epoch + 1}, step=step)
+
+
+def log_epoch(trainer):  # epoch-average train losses and validation metrics, at the epoch's last batch
+    wandb.log({**trainer.label_loss_items(trainer.tloss, prefix="train"), **trainer.metrics}, step=step)
+
+
+model = YOLO(WEIGHTS)
+model.add_callback("on_train_batch_end", log_batch)
+model.add_callback("on_fit_epoch_end", log_epoch)
+model.add_callback("on_train_end", lambda trainer: wandb.finish())
+
+model.train(
     data=str(DATA), 
     single_cls=SINGLE_CLS, 
     epochs=EPOCHS, 
