@@ -79,6 +79,7 @@ class Config:
     box_fraction: float = 0.25
     box_min_sigma: float = 3.0
     box_min_half_width: int = 2
+    box_min_half_height: int = 4  # rows; 4 = one probe depth step (same column) above and below the peak
     # Fallback units only: align the stored waveform to the peak time measured in the recording.
     center_search: int = 5
     center_min_spikes: int = 20
@@ -536,7 +537,7 @@ def build_templates(cfg, stored, sigma, shift=None, recomputed=None):
         components, _ = ndimage.label(bridged, structure=np.ones((3, 3), bool))
         rr, tt = np.nonzero(mask & (components == components[r, t]))
         hw = max(t - tt.min(), tt.max() - t, cfg.box_min_half_width)
-        hh = max(r - rr.min(), rr.max() - r)
+        hh = max(r - rr.min(), rr.max() - r, cfg.box_min_half_height)
         dt = int(center_dt[k])
         boxes[k] = (hw - dt, hw + dt, max(r - hh, 0), min(r + hh + 1, n_rows))
     return templates, boxes, peak_row, center_dt
