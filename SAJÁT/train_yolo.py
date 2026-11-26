@@ -1,4 +1,4 @@
-"""Train YOLO26n on one stage of the gray or rgb dataset. Change the settings below and run the file."""
+"""Train YOLO26n on one stage of a dataset build. Change the settings below and run the file."""
 import sys
 from pathlib import Path
 
@@ -13,18 +13,18 @@ from ultralytics.models.yolo.detect import DetectionTrainer
 from ultralytics.utils.torch_utils import unwrap_model
 
 # ---- settings ----
-MODE = "rgb"                  # "gray" | "rgb"
-STAGE = "stage2_up_to_3_spikes"  # "stage1_single_spike" | "stage2_up_to_3_spikes" | "stage3_any_spike_count"
-SINGLE_CLS = False             # True: spike / no spike, False: one class per unit
-EPOCHS = 20
-WEIGHTS = HERE / "runs/spikeyolo/stage2_up_to_3_spikes_rgb_agnostic_15ep/weights/best.pt"  # not in git: copy it over, or use HERE / "yolo26n.pt"
+# Build folder inside DATASETS/ (it differs per computer); its name ends in _gray or _rgb.
+BUILD = HERE.parent.parent / "DATASETS/nwb_asinh_stages_newdataset/build_20261121T161459Z_rgb"
+STAGE = "stage3_any_spike_count"  # "stage1_single_spike" | "stage2_up_to_3_spikes" | "stage3_any_spike_count"
+SINGLE_CLS = False  # True: spike / no spike, False: one class per unit
+EPOCHS = 100
+PATIENCE = 20       # stop when validation has not improved for this many epochs
+BATCH = 512         # what the Nov 2026 Windows runs used; lower it if memory runs out
+WEIGHTS = HERE / "yolo26n.pt"  # or a trained best.pt to continue from (weights are not in git)
 DEVICE = 0 if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"  # NVIDIA, Mac, else CPU
 
-DATASETS = {
-    "gray": HERE.parent.parent / "DATASETS/nwb_asinh_stages/build_20261112T160151Z_gray",
-    "rgb": HERE.parent.parent / "DATASETS/nwb_asinh_stages/build_20261112T161035Z_rgb",
-}
-DATA = DATASETS[MODE] / STAGE / "data.yaml"
+MODE = BUILD.name.rsplit("_", 1)[-1]  # "gray" or "rgb", from the build folder name
+DATA = BUILD / STAGE / "data.yaml"
 NAME = f"{STAGE}_{MODE}_{'agnostic' if SINGLE_CLS else 'multiclass'}_{EPOCHS}ep"
 
 
@@ -61,10 +61,11 @@ model.add_callback("on_train_end", lambda trainer: wandb.finish())
 model.train(
     data=str(DATA), 
     single_cls=SINGLE_CLS, 
-    epochs=EPOCHS, 
+    epochs=EPOCHS,
+    patience=PATIENCE,
     trainer=NoRectTrainer,
     imgsz=128, 
-    batch=64, 
+    batch=BATCH,
     device=DEVICE,
     workers=0, 
     seed=0,
