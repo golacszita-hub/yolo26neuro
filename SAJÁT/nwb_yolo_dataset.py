@@ -46,8 +46,8 @@ DATA_ROOT = Path(unicodedata.normalize("NFC", str(Path(__file__).resolve().paren
 
 @dataclass
 class Config:
-    nwb_path: str = str(DATA_ROOT / "Rat01_Insertion2_Depth2.nwb")
-    output_root: str = str(DATA_ROOT / "DATASETS" / "nwb_asinh_stages")
+    nwb_path: str = str(DATA_ROOT / "Rat01_Insertion1_Depth2.nwb")
+    output_root: str = str(DATA_ROOT / "DATASETS" / "nwb_asinh_stages_newdataset") 
     # Zero-phase bandpass; the margin makes the cache bit-identical to reading the NWB chain.
     freq_min: float = 300.0
     freq_max: float = 3000.0
@@ -80,7 +80,7 @@ class Config:
     box_fraction: float = 0.25
     box_min_sigma: float = 3.0
     box_min_half_width: int = 2
-    box_min_half_height: int = 4  # rows; 4 = one probe depth step (same column) above and below the peak
+    box_min_half_height: int = 2  # rows; 4 = one probe depth step (same column) above and below the peak
     # Fallback units only: align the stored waveform to the peak time measured in the recording.
     center_search: int = 5
     center_min_spikes: int = 20
