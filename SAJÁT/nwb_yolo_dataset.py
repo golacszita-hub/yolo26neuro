@@ -7,13 +7,14 @@ Labels come from the spike sorting, with one centred box per unit.
 Stages (cumulative):
   stage1_single_spike     one labelled spike
   stage2_up_to_3_spikes   adds windows with 2-3 labelled spikes
-  stage3_any_spike_count  adds sliding windows (--stage3)
+  stage3_any_spike_count  adds sliding windows
+Each stage contains the earlier ones; --stages picks which are written (default: stage 3 only).
 
 Usage (spike env):
-    python nwb_yolo_dataset.py                        # full build
+    python nwb_yolo_dataset.py                        # stage 3
+    python nwb_yolo_dataset.py --stages 1 2 3         # all three stages
     python nwb_yolo_dataset.py --quick                # small test build
     python nwb_yolo_dataset.py --image-mode gray rgb  # both encodings
-    python nwb_yolo_dataset.py --stage3               # also stage 3
 """
 
 from __future__ import annotations
@@ -89,7 +90,7 @@ class Config:
     negative_fraction: float = 0.10
     negative_margin: int = 40
     max_per_unit_count: dict | None = None  # windows per (split, unit, label count); None = no cap
-    build_stage3: bool = False
+    stages: tuple = (3,)  # stages to write, from 1, 2 and 3
     stage3_stride: int = 64
     stage3_max_images: dict | None = field(default_factory=lambda: {"train": 40000, "val": 8000, "test": 8000})
     seed: int = 0
@@ -652,7 +653,7 @@ def worker_state(cfg, ctx):
             "visible_sigma": cfg.visible_sigma,
             "edge_margin": ctx["edge_margin"], "edge_band": cfg.edge_band,
             "negative_margin": cfg.negative_margin,
-            "build_stage3": cfg.build_stage3, "stage3_stride": cfg.stage3_stride,
+            "build_stage3": 3 in cfg.stages, "stage3_stride": cfg.stage3_stride,
         })
     return state
 
@@ -765,7 +766,7 @@ def select_items(cfg, ctx):
         "stage1_single_spike": _cap_per_unit(ctx["anchored"], cfg.max_per_unit_count, rng),
         "stage2_up_to_3_spikes": _cap_per_unit(ctx["groups"], cfg.max_per_unit_count, rng),
     }
-    if cfg.build_stage3:
+    if 3 in cfg.stages:
         tiles = []
         for split in SPLITS:
             full = [it for it in ctx["tiles"] if it["split"] == split]
@@ -976,7 +977,9 @@ def build(cfg: Config, image_modes=None):
           + ", ".join(f"{s}={len(c)}" for s, c in ctx["chunks"].items()), flush=True)
     run_pass1(cfg, ctx)
     run_pass2(cfg, ctx)
-    stage_items = select_items(cfg, ctx)
+    # Every stage is selected, so a stage's content does not depend on which stages are written.
+    stage_items = {name: items for name, items in select_items(cfg, ctx).items()
+                   if int(name[len("stage")]) in cfg.stages}
     roots = []
     for mode in image_modes or [cfg.image_mode]:  # same windows and labels, one build per encoding
         root, stats = write_dataset(replace(cfg, image_mode=mode), ctx, stage_items)
@@ -994,16 +997,16 @@ def main():
     parser.add_argument("--image-mode", choices=IMAGE_MODES, nargs="+", default=None,
                         help="one or more encodings; each gets its own build folder with the same windows")
     parser.add_argument("--cache-dir", default=None, help="where the ~12 GB preprocessed copy is kept")
-    parser.add_argument("--stage3", action="store_true", help="also build stage 3 (sliding window, large)")
+    parser.add_argument("--stages", type=int, nargs="+", choices=(1, 2, 3), default=None,
+                        help="stages to write (default: 3)")
     args = parser.parse_args()
     cfg = Config()
     if args.quick:
         cfg.time_fraction = {"train": 0.02, "val": 0.03, "test": 0.03}
         cfg.stage3_max_images = {"train": 300, "val": 100, "test": 100}
-        cfg.build_stage3 = True  # small here, so the stage-3 code is exercised
         cfg.template_min_spikes = 20  # few chunks: at most ~80 spikes per unit are averaged
-    if args.stage3:
-        cfg.build_stage3 = True
+    if args.stages:
+        cfg.stages = tuple(sorted(set(args.stages)))
     if args.image_mode:
         cfg.image_mode = args.image_mode[0]
     for name in ("nwb_path", "cache_dir", "output_root", "workers"):
